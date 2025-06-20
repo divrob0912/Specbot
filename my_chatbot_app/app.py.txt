@@ -1,0 +1,180 @@
+import os
+import streamlit as st
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
+import logging
+import tempfile # Needed for saving uploaded files temporarily
+
+# Configure logging for better visibility
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- Configuration ---
+EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+GENERATIVE_MODEL_NAME = "gemini-2.0-flash"
+
+# Retrieve GOOGLE_API_KEY from Streamlit secrets
+# For local development, create a .streamlit/secrets.toml file
+# For deployment on Streamlit Cloud, configure secrets in the app dashboard
+try:
+    google_api_key = st.secrets["GOOGLE_API_KEY"]
+except KeyError:
+    st.error("Google API Key not found in Streamlit secrets. Please add it to .streamlit/secrets.toml or Streamlit Cloud secrets.")
+    st.stop() # Stop the app if API key is missing
+
+# --- Document Loading and Processing ---
+@st.cache_resource
+def load_and_process_documents(uploaded_files):
+    """
+    Loads multiple PDF documents from Streamlit's UploadedFile objects,
+    splits them into chunks, and generates embeddings.
+    Returns a FAISS vector store.
+    """
+    if not uploaded_files:
+        st.info("Please upload PDF documents to get started.")
+        return None
+
+    all_documents = []
+    # Iterate over each uploaded file
+    for uploaded_file in uploaded_files:
+        # Streamlit's uploaded files are in memory. We need to write them to a
+        # temporary file on disk so PyPDFLoader can access them by path.
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            tmp_file_path = tmp_file.name
+
+        logging.info(f"Loading document from temporary path: {tmp_file_path} for file: {uploaded_file.name}...")
+        try:
+            loader = PyPDFLoader(tmp_file_path)
+            documents = loader.load()
+            all_documents.extend(documents) # Add documents from current PDF to the collective list
+            logging.info(f"Loaded {len(documents)} pages from {uploaded_file.name}.")
+        except Exception as e:
+            st.warning(f"Could not load '{uploaded_file.name}'. Error: {e}")
+            logging.error(f"Error loading PDF '{uploaded_file.name}': {e}")
+        finally:
+            # Clean up the temporary file after processing
+            os.remove(tmp_file_path)
+
+    if not all_documents:
+        st.error("No valid PDF documents were loaded. Please check your uploaded files.")
+        return None
+
+    logging.info(f"Total pages loaded from all PDFs: {len(all_documents)}")
+
+    logging.info("Splitting documents into chunks...")
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    texts = text_splitter.split_documents(all_documents)
+    logging.info(f"Split into {len(texts)} chunks.")
+
+    logging.info(f"Initializing embeddings model: {EMBEDDING_MODEL_NAME}...")
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+    logging.info("Embeddings model loaded.")
+
+    logging.info("Creating FAISS vector store from document chunks...")
+    vectorstore = FAISS.from_documents(texts, embeddings)
+    logging.info("Vector store created successfully.")
+    return vectorstore
+
+# --- Chatbot Initialization ---
+@st.cache_resource
+def initialize_chatbot(vectorstore, api_key: str):
+    """
+    Initializes the Gemini LLM and sets up the RetrievalQA chain.
+    """
+    if not vectorstore:
+        st.error("Vector store not available for chatbot initialization.")
+        st.stop() # Stop the app if vectorstore is not ready
+
+    logging.info(f"Initializing generative model: {GENERATIVE_MODEL_NAME}...")
+    llm = ChatGoogleGenerativeAI(model=GENERATIVE_MODEL_NAME, google_api_key=api_key, temperature=0.2)
+    logging.info("Generative model loaded.")
+
+    template = """You are an AI assistant specialized in providing answers based on technical spec sheets.
+    Use only the following provided context to answer the user's question concisely and accurately.
+    If the answer is not explicitly in the context, state that you cannot find the answer in the provided documents and refrain from making up information.
+
+    Context:
+    {context}
+
+    Question: {question}
+
+    Answer:"""
+    QA_CHAIN_PROMPT = PromptTemplate.from_template(template)
+
+    logging.info("Setting up RetrievalQA chain...")
+    qa_chain = RetrievalQA.from_chain_type(
+        llm,
+        retriever=vectorstore.as_retriever(),
+        chain_type_kwargs={"prompt": QA_CHAIN_PROMPT},
+        return_source_documents=False
+    )
+    logging.info("Chatbot initialized successfully.")
+    return qa_chain
+
+# --- Streamlit App Layout ---
+def main():
+    st.set_page_config(page_title="Spec Sheet Chatbot", page_icon="📄")
+    st.title("📄 Multi-PDF Spec Sheet Chatbot")
+    st.markdown("""
+    Upload one or more PDF spec sheets, and then ask questions about their combined content.
+    """)
+
+    # File uploader for multiple PDF files
+    # The 'key' helps Streamlit differentiate this widget if others are added
+    uploaded_files = st.file_uploader("Upload your PDF spec sheets", type="pdf", accept_multiple_files=True, key="pdf_uploader")
+
+    vectorstore = None
+    if uploaded_files:
+        # Pass the list of uploaded files to the processing function
+        vectorstore = load_and_process_documents(uploaded_files)
+    else:
+        st.info("Upload PDF documents to activate the chatbot. Once uploaded, wait for processing to complete.")
+
+
+    qa_chatbot = None
+    # Initialize chatbot only if a vectorstore has been successfully created
+    if vectorstore:
+        qa_chatbot = initialize_chatbot(vectorstore, google_api_key)
+    
+    # Initialize chat history in session state
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # Display chat messages from history on app rerun
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # Accept user input only if chatbot is ready
+    if qa_chatbot:
+        if prompt := st.chat_input("Ask a question about the spec sheets..."):
+            # Add user message to chat history
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            # Display user message in chat message container
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    try:
+                        response = qa_chatbot.invoke({"query": prompt})
+                        answer = response["result"]
+                        st.markdown(answer)
+                    except Exception as e:
+                        logging.error(f"An error occurred during query processing: {e}")
+                        answer = f"Sorry, something went wrong while processing your request: {e}. Please try again."
+                        st.markdown(answer)
+                # Add assistant response to chat history
+                st.session_state.messages.append({"role": "assistant", "content": answer})
+    elif uploaded_files: # If files are uploaded but vectorstore/chatbot isn't ready
+        st.info("Processing PDFs and initializing chatbot. Please wait...")
+    else: # If no files are uploaded yet
+        st.info("Upload PDF documents to activate the chatbot.")
+
+if __name__ == "__main__":
+    main()
